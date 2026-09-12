@@ -12,6 +12,14 @@ export default {
       });
     }
 
+    if (url.pathname === "/health") {
+      return Response.json({
+        ok: true,
+        room: ROOM_ID,
+        hostTokenConfigured: !!env.HOST_TOKEN,
+      });
+    }
+
     const match = url.pathname.match(/^\/room\/([A-Z0-9]{6})$/i);
     if (!match || match[1].toUpperCase() !== ROOM_ID) {
       return new Response("Room not found", { status: 404 });
@@ -180,7 +188,6 @@ export class Room extends DurableObject {
         state: this.latestGuestState,
       });
       this.latestGuestState = null;
-    this.initialState = null;
       await this.ctx.storage.put("latestGuestState", null);
     }
 
