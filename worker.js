@@ -2,798 +2,355 @@ import { DurableObject } from "cloudflare:workers";
 
 const ROOM_ID = "AN26FC";
 
-/*
- * IMPORTANT:
- * Generate your own long random secret.
- *
- * The SAME value must be placed in coListen.js on YOUR
- * permanent-host Spotify installation.
- *
- * NEVER give this value to guests.
- */
-const HOST_TOKEN =
-  "REPLACE_WITH_YOUR_LONG_RANDOM_SECRET";
-
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const parts = url.pathname.split("/").filter(Boolean);
 
-    if (parts.length === 0) {
-      return new Response("CoListen server OK");
+    if (url.pathname === "/") {
+      return new Response("CoListen server is running. Permanent room: AN26FC", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
 
-    if (parts[0] !== "room") {
-      return new Response("Not found", { status: 404 });
+    const match = url.pathname.match(/^\/room\/([A-Z0-9]{6})$/i);
+    if (!match || match[1].toUpperCase() !== ROOM_ID) {
+      return new Response("Room not found", { status: 404 });
     }
 
-    const roomId = parts[1];
-
-    /*
-     * AN26FC is the ONLY room.
-     */
-    if (roomId !== ROOM_ID) {
-      return new Response("Invalid room", { status: 404 });
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("WebSocket upgrade required", { status: 426 });
     }
 
-    /*
-     * A deterministic Durable Object ID means the same room
-     * is always represented by the same Durable Object.
-     */
-    const id = env.ROOMS.idFromName(ROOM_ID);
-    const stub = env.ROOMS.get(id);
-
-    return stub.fetch(request);
-  }
+    const room = env.ROOMS.get(env.ROOMS.idFromName(ROOM_ID));
+    return room.fetch(request);
+  },
 };
 
-
 export class Room extends DurableObject {
-
   constructor(ctx, env) {
     super(ctx, env);
-
     this.ctx = ctx;
     this.env = env;
-
-    /*
-     * Connected WebSocket clients.
-     */
-    this.sessions = new Map();
-
-    /*
-     * Persistent room data.
-     */
-    this.hostName = null;
+    this.hostSid = null;
+    this.loaded = false;
+    this.hostName = "";
     this.lastState = null;
     this.queueSnapshot = [];
-
-    this.initialized = false;
   }
 
+  async load() {
+    if (this.loaded) return;
+    const stored = await this.ctx.storage.get(["hostName", "lastState", "queueSnapshot"]);
+    this.hostName = stored.hostName || "";
+    this.lastState = stored.lastState || null;
+    this.queueSnapshot = Array.isArray(stored.queueSnapshot) ? stored.queueSnapshot : [];
+    this.loaded = true;
 
-  async initialize() {
-    if (this.initialized) {
-      return;
+    // Recover host identity after a DO restart by inspecting accepted sockets.
+    for (const ws of this.ctx.getWebSockets()) {
+      const meta = ws.deserializeAttachment?.();
+      if (meta?.isHost) {
+        this.hostSid = meta.sid;
+        break;
+      }
     }
-
-    this.hostName =
-      await this.ctx.storage.get("hostName") || null;
-
-    this.lastState =
-      await this.ctx.storage.get("lastState") || null;
-
-    this.queueSnapshot =
-      await this.ctx.storage.get("queueSnapshot") || [];
-
-    this.initialized = true;
   }
 
+  sockets() {
+    return this.ctx.getWebSockets();
+  }
+
+  send(ws, msg) {
+    try {
+      ws.send(JSON.stringify(msg));
+    } catch {}
+  }
+
+  broadcast(msg, exceptSid = null) {
+    const data = JSON.stringify(msg);
+    for (const ws of this.sockets()) {
+      const meta = ws.deserializeAttachment?.();
+      if (exceptSid && meta?.sid === exceptSid) continue;
+      try {
+        ws.send(data);
+      } catch {}
+    }
+  }
+
+  findHostSocket() {
+    for (const ws of this.sockets()) {
+      const meta = ws.deserializeAttachment?.();
+      if (meta?.isHost) return ws;
+    }
+    return null;
+  }
 
   async fetch(request) {
-    await this.initialize();
+    await this.load();
 
-    /*
-     * HTTP health/status request.
-     */
-    if (
-      request.headers.get("Upgrade") !== "websocket"
-    ) {
-      return new Response(
-        JSON.stringify({
-          room: ROOM_ID,
-          host: this.hostName,
-          hostConnected: this.isHostConnected(),
-          members: this.getMembers(),
-          hasState: !!this.lastState
-        }),
-        {
-          headers: {
-            "Content-Type": "application/json"
-          }
-        }
-      );
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("WebSocket upgrade required", { status: 426 });
     }
-
 
     const url = new URL(request.url);
+    const name = (url.searchParams.get("name") || "Guest").trim().slice(0, 64) || "Guest";
+    const suppliedToken = url.searchParams.get("hostToken") || "";
+    const expectedToken = this.env.HOST_TOKEN || "";
 
-    const name =
-      url.searchParams.get("name") ||
-      "Anonymous";
+    // A host connection MUST prove possession of the Cloudflare secret.
+    // Supplying a wrong token is an authentication failure, not a guest login.
+    const wantsHost = suppliedToken.length > 0;
+    const isHost = wantsHost && suppliedToken === expectedToken;
 
-    const hostToken =
-      url.searchParams.get("hostToken") ||
-      "";
+    if (wantsHost && !isHost) {
+      return new Response("Invalid host token", { status: 401 });
+    }
 
+    if (!expectedToken) {
+      return new Response("HOST_TOKEN is not configured in Worker secrets", { status: 500 });
+    }
 
-    /*
-     * The host is identified by the permanent secret,
-     * NOT by the WebSocket ID.
-     */
-    const isHost =
-      hostToken === HOST_TOKEN;
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
 
+    const sid = crypto.randomUUID();
 
-    const pair =
-      new WebSocketPair();
-
-    const client =
-      pair[0];
-
-    const server =
-      pair[1];
-
-    server.accept();
-
-
-    /*
-     * A new temporary connection ID.
-     *
-     * This is NOT the host identity.
-     */
-    const sid =
-      crypto.randomUUID();
-
-
-    /*
-     * If this is the permanent host installation,
-     * remember its display name.
-     */
+    // If the permanent host reconnects, the new connection replaces the old
+    // host connection. The identity remains the same because it is token-based.
     if (isHost) {
+      const oldHost = this.findHostSocket();
+      if (oldHost) {
+        try {
+          oldHost.close(4001, "Permanent host reconnected");
+        } catch {}
+      }
+    }
+
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({
+      sid,
+      name,
+      isHost,
+    });
+
+    if (isHost) {
+      this.hostSid = sid;
       this.hostName = name;
-
-      await this.ctx.storage.put(
-        "hostName",
-        name
-      );
-
-      /*
-       * If the same host reconnects while an old connection
-       * still exists, close the old host connection.
-       */
-      for (
-        const [oldSid, oldSession]
-        of this.sessions
-      ) {
-        if (oldSession.isHost) {
-
-          try {
-            oldSession.ws.close(
-              1000,
-              "Host reconnected"
-            );
-          } catch {}
-
-          this.sessions.delete(oldSid);
-        }
-      }
+      await this.ctx.storage.put("hostName", name);
     }
 
+    const members = this.getMembers();
 
-    this.sessions.set(
-      sid,
-      {
-        ws: server,
-        name,
-        isHost
-      }
-    );
+    this.send(server, {
+      type: "room_info",
+      room: ROOM_ID,
+      isHost,
+      hostName: this.hostName || "Permanent host",
+      hostConnected: !!this.findHostSocket(),
+      members,
+    });
 
-
-    /*
-     * Tell this client everything it needs to know.
-     */
-    this.sendTo(
-      sid,
-      {
-        type: "room_info",
-
-        room: ROOM_ID,
-
-        hostName: this.hostName,
-
-        isHost,
-
-        hostConnected:
-          this.isHostConnected(),
-
-        members:
-          this.getMembers()
-      }
-    );
-
-
-    /*
-     * A guest immediately receives the last known
-     * canonical playback state.
-     */
-    if (
-      !isHost &&
-      this.lastState
-    ) {
-      this.sendTo(
-        sid,
-        {
-          type: "state",
-          state: this.lastState
-        }
-      );
+    // Give a joining guest the last durable state immediately. If the host is
+    // online, it will then send an even fresher canonical state.
+    if (!isHost) {
+      if (this.lastState) this.send(server, { type: "state", state: this.lastState });
+      this.send(server, { type: "queue_snapshot", uris: this.queueSnapshot });
     }
 
-
-    /*
-     * Give a newly joined guest the current queue.
-     */
-    if (
-      !isHost &&
-      Array.isArray(this.queueSnapshot)
-    ) {
-      this.sendTo(
-        sid,
-        {
-          type: "queue_snapshot",
-          uris: this.queueSnapshot
-        }
-      );
-    }
-
-
-    /*
-     * Tell everybody else about the new member.
-     */
     this.broadcast(
       {
         type: "joined",
-        user: name
+        user: name,
       },
       sid
     );
 
-    this.broadcastMembers();
-
-
-    /*
-     * WebSocket message handler.
-     */
-    server.addEventListener(
-      "message",
-      async event => {
-
-        try {
-
-          const msg =
-            JSON.parse(event.data);
-
-          await this.handleMessage(
-            sid,
-            msg
-          );
-
-        } catch (error) {
-
-          console.error(
-            "CoListen message error:",
-            error
-          );
-
-        }
-      }
-    );
-
-
-    /*
-     * Disconnect.
-     */
-    server.addEventListener(
-      "close",
-      () => {
-
-        const session =
-          this.sessions.get(sid);
-
-        this.sessions.delete(sid);
-
-        if (session) {
-
-          this.broadcast({
-            type: "left",
-            user: session.name
-          });
-
-        }
-
-        this.broadcastMembers();
-
-
-        /*
-         * IMPORTANT:
-         *
-         * We do NOT delete the permanent host.
-         *
-         * AN26FC remains associated with the same host
-         * token even while the host is offline.
-         */
-        if (
-          session &&
-          session.isHost
-        ) {
-
-          this.broadcast({
-            type: "host_status",
-            connected: false,
-            hostName: this.hostName
-          });
-
-        }
-      }
-    );
-
-
-    server.addEventListener(
-      "error",
-      () => {
-        this.sessions.delete(sid);
-      }
-    );
-
-
-    return new Response(
-      null,
-      {
-        status: 101,
-        webSocket: client
-      }
-    );
-  }
-
-
-  /*
-   * ============================================
-   * HOST
-   * ============================================
-   */
-
-  isHostConnected() {
-
-    for (
-      const session
-      of this.sessions.values()
-    ) {
-
-      if (session.isHost) {
-        return true;
-      }
-
-    }
-
-    return false;
-  }
-
-
-  getHost() {
-
-    for (
-      const [sid, session]
-      of this.sessions
-    ) {
-
-      if (session.isHost) {
-
-        return {
-          sid,
-          ...session
-        };
-
-      }
-    }
-
-    return null;
-  }
-
-
-  /*
-   * ============================================
-   * MEMBERS
-   * ============================================
-   */
-
-  getMembers() {
-
-    return [
-      ...this.sessions.values()
-    ].map(
-      session => session.name
-    );
-  }
-
-
-  broadcastMembers() {
-
     this.broadcast({
       type: "members",
-      members: this.getMembers()
+      members: this.getMembers(),
     });
 
+    this.broadcast({
+      type: "host_status",
+      connected: !!this.findHostSocket(),
+      hostName: this.hostName || "Permanent host",
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
+  getMembers() {
+    const names = [];
+    for (const ws of this.sockets()) {
+      const meta = ws.deserializeAttachment?.();
+      if (meta?.name && !names.includes(meta.name)) names.push(meta.name);
+    }
+    return names;
+  }
 
-  /*
-   * ============================================
-   * MESSAGE ROUTER
-   * ============================================
-   */
+  async webSocketMessage(ws, message) {
+    await this.load();
 
-  async handleMessage(
-    senderId,
-    msg
-  ) {
-
-    if (!msg?.type) {
+    let msg;
+    try {
+      msg = JSON.parse(message);
+    } catch {
       return;
     }
 
+    const meta = ws.deserializeAttachment?.();
+    if (!meta) return;
 
-    const sender =
-      this.sessions.get(senderId);
+    // Never trust the client-supplied _sid for authorization.
+    const senderSid = meta.sid;
 
-    if (!sender) {
+    if (msg.type === "ts_req") {
+      const host = this.findHostSocket();
+      if (!host) {
+        this.send(ws, { type: "host_unavailable" });
+        return;
+      }
+
+      // Host must answer its own timestamp request; route guest requests only
+      // to the authenticated permanent host.
+      if (meta.isHost) {
+        this.send(ws, {
+          type: "ts_resp",
+          id: msg.id,
+          t0: msg.t0,
+          t1: Date.now(),
+        });
+      } else {
+        this.send(host, {
+          type: "ts_req",
+          id: msg.id,
+          t0: msg.t0,
+          requestFrom: senderSid,
+        });
+      }
       return;
     }
 
+    if (msg.type === "ts_resp") {
+      // Timestamp responses from the host are routed only to the guest that
+      // originally requested them.
+      if (!meta.isHost) return;
+      const targetSid = msg.requestFrom || msg._sid;
+      if (!targetSid) return;
 
-    /*
-     * --------------------------------------------
-     * Guest → Permanent Host
-     * --------------------------------------------
-     *
-     * Every guest can request playback actions.
-     *
-     * Only the permanent host executes them.
-     */
+      for (const peer of this.sockets()) {
+        const peerMeta = peer.deserializeAttachment?.();
+        if (peerMeta?.sid === targetSid) {
+          this.send(peer, {
+            type: "ts_resp",
+            id: msg.id,
+            t0: msg.t0,
+            t1: msg.t1,
+          });
+          break;
+        }
+      }
+      return;
+    }
+
     if (msg.type === "cmd") {
-
-      const host =
-        this.getHost();
+      const host = this.findHostSocket();
 
       if (!host) {
-
-        this.sendTo(
-          senderId,
-          {
-            type: "host_unavailable",
-            hostName: this.hostName
-          }
-        );
-
+        this.send(ws, { type: "host_unavailable" });
         return;
       }
 
+      // Commands are always executed by the permanent host, regardless of
+      // which guest sent them.
+      if (meta.isHost) {
+        return;
+      }
 
-      this.sendTo(
-        host.sid,
-        {
-          type: "cmd",
-
-          cmd: msg.cmd,
-
-          requestFrom: senderId
-        }
-      );
-
+      this.send(host, {
+        type: "cmd",
+        cmd: msg.cmd,
+        requestFrom: senderSid,
+      });
       return;
     }
 
-
-    /*
-     * --------------------------------------------
-     * Host → Server: canonical playback state
-     * --------------------------------------------
-     */
     if (msg.type === "state") {
+      // Only the permanent host may publish canonical playback state.
+      if (!meta.isHost) return;
+      if (!msg.state?.uri) return;
 
-      /*
-       * Guests cannot publish canonical state.
-       */
-      if (!sender.isHost) {
-        return;
-      }
+      this.lastState = {
+        uri: String(msg.state.uri),
+        name: String(msg.state.name || ""),
+        position: Number(msg.state.position || 0),
+        isPlaying: !!msg.state.isPlaying,
+        sentAt: Number(msg.state.sentAt || Date.now()),
+      };
 
-
-      this.lastState =
-        msg.state;
-
-
-      await this.ctx.storage.put(
-        "lastState",
-        this.lastState
-      );
-
-
-      /*
-       * Send canonical state to everyone except host.
-       */
+      await this.ctx.storage.put("lastState", this.lastState);
       this.broadcast(
         {
           type: "state",
-          state: this.lastState
+          state: this.lastState,
         },
-        senderId
+        senderSid
       );
-
       return;
     }
 
-
-    /*
-     * --------------------------------------------
-     * Guest → Host time synchronization
-     * --------------------------------------------
-     */
-    if (msg.type === "ts_req") {
-
-      const host =
-        this.getHost();
-
-      if (!host) {
-        return;
-      }
-
-
-      this.sendTo(
-        host.sid,
-        {
-          type: "ts_req",
-
-          id: msg.id,
-
-          t0: msg.t0,
-
-          requestFrom: senderId
-        }
-      );
-
-      return;
-    }
-
-
-    /*
-     * --------------------------------------------
-     * Host → Guest time synchronization response
-     * --------------------------------------------
-     */
-    if (msg.type === "ts_resp") {
-
-      if (!sender.isHost) {
-        return;
-      }
-
-
-      if (msg.requestFrom) {
-
-        this.sendTo(
-          msg.requestFrom,
-          msg
-        );
-
-      }
-
-      return;
-    }
-
-
-    /*
-     * --------------------------------------------
-     * Queue addition
-     * --------------------------------------------
-     */
     if (msg.type === "queue_add") {
+      if (!meta.isHost || !msg.uri) return;
 
-      if (!sender.isHost) {
-        return;
+      const uri = String(msg.uri);
+      if (!this.queueSnapshot.includes(uri)) {
+        this.queueSnapshot.push(uri);
+        if (this.queueSnapshot.length > 50) this.queueSnapshot = this.queueSnapshot.slice(-50);
       }
 
+      await this.ctx.storage.put("queueSnapshot", this.queueSnapshot);
+      this.broadcast({ type: "queue_add", uri }, senderSid);
+      return;
+    }
 
-      if (!msg.uri) {
-        return;
-      }
+    if (msg.type === "queue_snapshot") {
+      if (!meta.isHost || !Array.isArray(msg.uris)) return;
 
+      this.queueSnapshot = msg.uris
+        .filter((x) => typeof x === "string" && x.length > 0)
+        .slice(0, 50);
 
-      if (
-        !this.queueSnapshot.includes(
-          msg.uri
-        )
-      ) {
-
-        this.queueSnapshot.push(
-          msg.uri
-        );
-
-
-        /*
-         * Avoid an infinitely growing room queue.
-         */
-        if (
-          this.queueSnapshot.length > 100
-        ) {
-
-          this.queueSnapshot =
-            this.queueSnapshot.slice(-100);
-
-        }
-
-
-        await this.ctx.storage.put(
-          "queueSnapshot",
-          this.queueSnapshot
-        );
-      }
-
-
-      this.broadcast(
-        {
-          type: "queue_add",
-          uri: msg.uri
-        },
-        senderId
-      );
-
+      await this.ctx.storage.put("queueSnapshot", this.queueSnapshot);
+      this.broadcast({ type: "queue_snapshot", uris: this.queueSnapshot }, senderSid);
       return;
     }
 
 
-    /*
-     * --------------------------------------------
-     * Queue snapshot
-     * --------------------------------------------
-     */
-    if (
-      msg.type === "queue_snapshot"
-    ) {
+  }
 
-      if (!sender.isHost) {
-        return;
-      }
+  async webSocketClose(ws) {
+    await this.load();
 
+    const meta = ws.deserializeAttachment?.();
+    if (!meta) return;
 
-      if (
-        !Array.isArray(msg.uris)
-      ) {
-        return;
-      }
+    const wasHost = !!meta.isHost;
 
-
-      this.queueSnapshot =
-        msg.uris.slice(0, 100);
-
-
-      await this.ctx.storage.put(
-        "queueSnapshot",
-        this.queueSnapshot
-      );
-
-
-      this.broadcast(
-        {
-          type: "queue_snapshot",
-          uris: this.queueSnapshot
-        },
-        senderId
-      );
-
-      return;
+    if (wasHost && this.hostSid === meta.sid) {
+      this.hostSid = null;
     }
 
+    this.broadcast({ type: "left", user: meta.name });
+    this.broadcast({ type: "members", members: this.getMembers() });
 
-    /*
-     * --------------------------------------------
-     * Host heartbeat/status
-     * --------------------------------------------
-     */
-    if (
-      msg.type === "host_ping"
-    ) {
-
-      if (!sender.isHost) {
-        return;
-      }
-
-
+    if (wasHost) {
       this.broadcast({
         type: "host_status",
-        connected: true,
-        hostName: this.hostName
+        connected: !!this.findHostSocket(),
+        hostName: this.hostName || "Permanent host",
       });
-
-      return;
     }
   }
 
-
-  sendTo(
-    sid,
-    msg
-  ) {
-
-    const session =
-      this.sessions.get(sid);
-
-    if (!session) {
-      return;
-    }
-
-
-    try {
-
-      session.ws.send(
-        JSON.stringify(msg)
-      );
-
-    } catch (error) {
-
-      console.error(
-        "CoListen sendTo error:",
-        error
-      );
-
-    }
-  }
-
-
-  broadcast(
-    msg,
-    excludeId = null
-  ) {
-
-    const data =
-      JSON.stringify(msg);
-
-
-    for (
-      const [sid, session]
-      of this.sessions
-    ) {
-
-      if (
-        sid === excludeId
-      ) {
-        continue;
-      }
-
-
-      try {
-
-        session.ws.send(data);
-
-      } catch (error) {
-
-        console.error(
-          "CoListen broadcast error:",
-          error
-        );
-
-      }
-    }
-  }
 }
