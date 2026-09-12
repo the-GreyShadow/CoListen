@@ -36,14 +36,19 @@ export class Room extends DurableObject {
     this.hostName = "";
     this.lastState = null;
     this.queueSnapshot = [];
+    this.latestGuestState = null;
+    this.initialState = null;
+    this.firstJoinSid = null;
   }
 
   async load() {
     if (this.loaded) return;
-    const stored = await this.ctx.storage.get(["hostName", "lastState", "queueSnapshot"]);
+    const stored = await this.ctx.storage.get(["hostName", "lastState", "queueSnapshot", "latestGuestState", "initialState"]);
     this.hostName = stored.hostName || "";
     this.lastState = stored.lastState || null;
     this.queueSnapshot = Array.isArray(stored.queueSnapshot) ? stored.queueSnapshot : [];
+    this.latestGuestState = stored.latestGuestState || null;
+    this.initialState = stored.initialState || null;
     this.loaded = true;
 
     // Recover host identity after a DO restart by inspecting accepted sockets.
@@ -115,6 +120,8 @@ export class Room extends DurableObject {
     const server = pair[1];
 
     const sid = crypto.randomUUID();
+    const isFirstJoiner = this.getMembers().length === 0;
+    if (isFirstJoiner) this.firstJoinSid = sid;
 
     // If the permanent host reconnects, the new connection replaces the old
     // host connection. The identity remains the same because it is token-based.
@@ -132,6 +139,7 @@ export class Room extends DurableObject {
       sid,
       name,
       isHost,
+      isFirstJoiner,
     });
 
     if (isHost) {
@@ -151,11 +159,29 @@ export class Room extends DurableObject {
       members,
     });
 
+    // The first client into an empty room establishes the initial playback
+    // state. A later client adopts that state, regardless of whether the first
+    // client was the host or the guest. This is separate from the permanent
+    // host role: after both are connected, the host is the canonical authority.
+    if (this.initialState && !isHost) {
+      this.send(server, { type: "initial_state", state: this.initialState });
+    } else if (this.initialState && isHost && this.getMembers().length > 1) {
+      this.send(server, { type: "initial_state", state: this.initialState });
+    }
+
     // Give a joining guest the last durable state immediately. If the host is
     // online, it will then send an even fresher canonical state.
     if (!isHost) {
       if (this.lastState) this.send(server, { type: "state", state: this.lastState });
       this.send(server, { type: "queue_snapshot", uris: this.queueSnapshot });
+    } else if (this.latestGuestState) {
+      this.send(server, {
+        type: "startup_sync_state",
+        state: this.latestGuestState,
+      });
+      this.latestGuestState = null;
+    this.initialState = null;
+      await this.ctx.storage.put("latestGuestState", null);
     }
 
     this.broadcast(
@@ -254,6 +280,70 @@ export class Room extends DurableObject {
       return;
     }
 
+    if (msg.type === "initial_state") {
+      // Only the actual first connection is allowed to establish the initial
+      // state. This makes "first to join wins" deterministic even if the two
+      // clients send their state at nearly the same time.
+      if (meta.sid !== this.firstJoinSid || this.initialState || !msg.state?.uri) return;
+
+      this.initialState = {
+        uri: String(msg.state.uri),
+        name: String(msg.state.name || ""),
+        position: Number(msg.state.position || 0),
+        isPlaying: !!msg.state.isPlaying,
+        sentAt: Number(msg.state.sentAt || Date.now()),
+      };
+      await this.ctx.storage.put("initialState", this.initialState);
+
+      // The second client may already be connected by the time the first
+      // client's playback state arrives, so always forward the first state
+      // to every other client.
+      this.broadcast({ type: "initial_state", state: this.initialState }, senderSid);
+      return;
+    }
+
+    if (msg.type === "control_state") {
+      // A guest's native Spotify controls become a canonical state change by
+      // the permanent host. Never let a guest write the canonical state store.
+      if (meta.isHost || !msg.state?.uri) return;
+      const host = this.findHostSocket();
+      if (!host) {
+        // Host offline: keep only the latest playback state for startup sync.
+        this.latestGuestState = {
+          uri: String(msg.state.uri),
+          name: String(msg.state.name || ""),
+          position: Number(msg.state.position || 0),
+          isPlaying: !!msg.state.isPlaying,
+          sentAt: Number(msg.state.sentAt || Date.now()),
+        };
+        await this.ctx.storage.put("latestGuestState", this.latestGuestState);
+        return;
+      }
+      this.send(host, {
+        type: "control_state",
+        state: msg.state,
+        requestFrom: senderSid,
+      });
+      return;
+    }
+
+    if (msg.type === "guest_state") {
+      // Keep only the latest state while there is no permanent host.
+      // There is deliberately no command queue.
+      if (meta.isHost || this.findHostSocket() || !msg.state?.uri) return;
+
+      this.latestGuestState = {
+        uri: String(msg.state.uri),
+        name: String(msg.state.name || ""),
+        position: Number(msg.state.position || 0),
+        isPlaying: !!msg.state.isPlaying,
+        sentAt: Number(msg.state.sentAt || Date.now()),
+      };
+
+      await this.ctx.storage.put("latestGuestState", this.latestGuestState);
+      return;
+    }
+
     if (msg.type === "cmd") {
       const host = this.findHostSocket();
 
@@ -342,7 +432,15 @@ export class Room extends DurableObject {
     }
 
     this.broadcast({ type: "left", user: meta.name });
-    this.broadcast({ type: "members", members: this.getMembers() });
+    const remaining = this.getMembers();
+    this.broadcast({ type: "members", members: remaining });
+
+    if (remaining.length === 0) {
+      this.initialState = null;
+      this.firstJoinSid = null;
+      await this.ctx.storage.put("initialState", null);
+      // A new empty session may establish a fresh first-joiner state.
+    }
 
     if (wasHost) {
       this.broadcast({
