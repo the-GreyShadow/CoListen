@@ -1,0 +1,21 @@
+{
+  "name": "colisten-server",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-12",
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOMS",
+        "class_name": "Room"
+      }
+    ]
+  },
+
+  "exports": {
+    "Room": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
