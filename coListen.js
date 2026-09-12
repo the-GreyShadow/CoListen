@@ -151,6 +151,14 @@ function main() {
 
     const SERVER_URL_KEY = "coListen:serverUrl";
 
+    // Permanent CoListen room.
+    // The host credential is NOT embedded in this extension. The private host
+    // installation stores it in Spicetify.LocalStorage; guest installations
+    // leave it empty and therefore join as guests automatically.
+    const PERMANENT_ROOM_ID = "AN26FC";
+    const HOST_TOKEN_STORAGE_KEY = "coListen:hostToken";
+    const HOST_TOKEN = Spicetify.LocalStorage.get(HOST_TOKEN_STORAGE_KEY) || "";
+
     function getServerUrl() {
         const saved = Spicetify.LocalStorage.get(SERVER_URL_KEY);
         return saved && saved.trim() ? saved.trim() : null;
@@ -171,9 +179,11 @@ function main() {
         amHost: false,
         active: false,
         inSession: false,
-        code: "",
+        code: PERMANENT_ROOM_ID,
         myName: "",
         sid: "",
+        hostName: "",
+        hostConnected: false,
         members: [],
         myLatency: null,
         pingMap: {},
@@ -222,11 +232,7 @@ function main() {
     const getUsername = () => Spicetify.LocalStorage.get(STORAGE_KEY) || getSpotifyUsername();
     const saveUsername = (n) => Spicetify.LocalStorage.set(STORAGE_KEY, n);
 
-    function makeCode() {
-        const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        return Array.from({ length: 6 }, () => c[Math.floor(Math.random() * c.length)]).join("");
-    }
-
+    // Room code is permanent; there is intentionally no random code generator.
     function send(msg) {
         if (session.ws?.readyState === WebSocket.OPEN) {
             const tagged = { ...msg, _sid: session.sid };
@@ -470,9 +476,53 @@ function main() {
     function onMessage(msg) {
         if (!msg?.type || (msg._sid && msg._sid === session.sid)) return;
 
+        // Permanent-room metadata. The server decides who the permanent host is.
+        if (msg.type === "room_info") {
+            session.code = PERMANENT_ROOM_ID;
+            session.hostName = msg.hostName || "Permanent host";
+            session.hostConnected = !!msg.hostConnected;
+            session.amHost = !!msg.isHost;
+            session.inSession = session.amHost ? (session.inSession && session.members.length > 1) : true;
+
+            if (session.amHost) {
+                startHeartbeat();
+                stopPeriodicTimesync();
+                stopPredictLoop();
+                // Publish the host's canonical state immediately after reconnect.
+                setTimeout(() => {
+                    const s = getState();
+                    if (s) send({ type: "state", state: s });
+                    const snap = getQueueSnapshot();
+                    send({ type: "queue_snapshot", uris: snap });
+                }, 250);
+            } else {
+                startPeriodicTimesync();
+                startPredictLoop();
+                // Ask the permanent host for its freshest state.
+                send({ type: "cmd", cmd: { action: "request_state" } });
+            }
+            notifyUI();
+            return;
+        }
+
+        if (msg.type === "host_status") {
+            session.hostConnected = !!msg.connected;
+            session.hostName = msg.hostName || session.hostName || "Permanent host";
+            notifyUI();
+            if (!session.hostConnected && !session.amHost) {
+                Spicetify.showNotification("Permanent host is offline — playback commands will work when it reconnects.");
+            }
+            return;
+        }
+
+        if (msg.type === "host_unavailable") {
+            Spicetify.showNotification("Permanent host is offline. Please wait for the host to reconnect.");
+            return;
+        }
+
         // Time-sync handshake
         if (msg.type === "ts_req" && session.amHost) {
-            send({ type: "ts_resp", id: msg.id, t0: msg.t0, t1: Date.now() });
+            send({ type: "ts_resp", id: msg.id, t0: msg.t0, t1: Date.now(), requestFrom: msg.requestFrom });
             return;
         }
         if (msg.type === "ts_resp") {
@@ -593,7 +643,7 @@ function main() {
         if (!session.active) return;
         setTimeout(() => {
             const s = getState();
-            if (s) {
+            if (session.amHost && s) {
                 log("local songchange → broadcast");
                 send({ type: "state", state: s });
             }
@@ -646,10 +696,16 @@ function main() {
         session.heartbeatTimer = null;
     }
 
-    function connectToRoom(code, username, asHost, onProgress) {
+    function connectToRoom(username, onProgress) {
         const serverUrl = getServerUrl();
         if (!serverUrl) { onProgress({ type: "error", reason: "no-url" }); return; }
-        const url = `${serverUrl}/room/${code}?name=${encodeURIComponent(username)}`;
+
+        const encodedName = encodeURIComponent(username);
+        // The permanent host credential is only sent by the private host installation.
+        // Guests connect with no host token.
+        const tokenPart = HOST_TOKEN ? `&hostToken=${encodeURIComponent(HOST_TOKEN)}` : "";
+        const url = `${serverUrl}/room/${PERMANENT_ROOM_ID}?name=${encodedName}${tokenPart}`;
+
         const ws = new WebSocket(url);
         session.ws = ws;
 
@@ -660,30 +716,28 @@ function main() {
         ws.onopen = () => {
             clearTimeout(timeout);
             session.active = true;
-            session.amHost = asHost;
-            session.code = code;
+            session.code = PERMANENT_ROOM_ID;
             session.myName = username;
             session.sid = Math.random().toString(36).slice(2);
             session.reconnectCount = 0;
             session.intentionalClose = false;
 
-            // Host is the reference clock → offset 0.
-            // Guest resets and re-syncs on every fresh connection.
+            // The server sends room_info and decides the authoritative host role.
+            session.amHost = false;
+            session.inSession = false;
+            session.hostConnected = false;
+            session.hostName = "";
+
             session.clockOffset = 0;
             session.clockOffsetConfidence = 0;
             session.lastHostState = null;
             session.lastPlayStateChange = 0;
             session.processedQueueUris = new Set();
 
-            if (!session.members.find(m => m.name === username)) session.members.push({ name: username });
-
-            if (asHost) {
-                startHeartbeat();
-            } else {
-                session.inSession = true;
-                startPeriodicTimesync();
-                startPredictLoop();
+            if (!session.members.find(m => m.name === username)) {
+                session.members.push({ name: username });
             }
+
             onProgress({ type: "connected" });
             notifyUI();
         };
@@ -695,10 +749,7 @@ function main() {
         ws.onclose = () => {
             if (session.intentionalClose) return;
             if (session.active) {
-                const savedCode    = session.code;
-                const savedName    = session.myName;
-                const savedAsHost  = session.amHost;
-                const savedMembers = [...session.members];
+                const savedName = session.myName;
                 const reconnectNum = session.reconnectCount + 1;
                 if (reconnectNum > 5) {
                     cleanup();
@@ -709,9 +760,8 @@ function main() {
                 session.reconnectCount = reconnectNum;
                 Spicetify.showNotification(`⚠️ Reconnecting (${reconnectNum}/5)…`);
                 session.reconnectTimer = setTimeout(() => {
-                    session.members = savedMembers;
-                    connectToRoom(savedCode, savedName, savedAsHost, (ev) => {
-                        if (ev.type === "connected") {
+                    connectToRoom(savedName, (ev2) => {
+                        if (ev2.type === "connected") {
                             Spicetify.showNotification("✅ Reconnected!");
                             notifyUI();
                         }
@@ -734,9 +784,11 @@ function main() {
         session.myLatency     = null;
         session.pingMap       = {};
         session.members       = [];
-        session.code          = "";
+        session.code          = PERMANENT_ROOM_ID;
         session.myName        = "";
         session.sid           = "";
+        session.hostName      = "";
+        session.hostConnected = false;
         session.lastSharedState     = null;
         session.lastHostState       = null;
         session.reconnectCount      = 0;
@@ -911,8 +963,7 @@ function main() {
         async function create() {
             if (!getServerUrl()) { setConfiguringUrl(true); return; }
             setError(""); setLoading(true);
-            const code = makeCode();
-            connectToRoom(code, username, true, ev => {
+            connectToRoom(username, ev => {
                 if (ev.type === "connected") { setLoading(false); setTick(t => t+1); }
                 if (ev.type === "error" || ev.type === "no-url" || ev.type === "timeout") { setError("Connection failed — check your server URL"); setLoading(false); }
             });
@@ -920,10 +971,8 @@ function main() {
 
         async function join() {
             if (!getServerUrl()) { setConfiguringUrl(true); return; }
-            const code = paste.trim().toUpperCase();
-            if (code.length !== 6) { setError("Enter a 6-character code."); return; }
             setError(""); setLoading(true);
-            connectToRoom(code, username, false, ev => {
+            connectToRoom(username, ev => {
                 if (ev.type === "connected") { setLoading(false); setTick(t => t+1); }
                 if (ev.type === "error" || ev.type === "no-url" || ev.type === "timeout") { setError("Connection failed — check your server URL"); setLoading(false); }
             });
@@ -998,25 +1047,24 @@ function main() {
                     e("input", { className: "lt-ni", value: username, placeholder: "Your name", onChange: onName })
                 ),
                 e("div", { className: "lt-st" },
-                    e("button", {
+                    HOST_TOKEN
+                    ? e("button", {
                         className: `lt-btn lt-g ${loading ? "lt-dim" : ""}`,
                         onClick: create
-                    }, loading ? e(React.Fragment, null, e("span", { className: "lt-sp" }), "Setting up…") : "Create session")
+                    }, loading ? e(React.Fragment, null, e("span", { className: "lt-sp" }), "Connecting…") : "Connect as permanent host")
+                    : e("div", { style: { fontSize: 10, color: "#444", textAlign: "center", marginBottom: 2 } }, "Guest mode — permanent host is assigned automatically")
                 ),
                 e("hr", { className: "lt-dv" }),
-                e("div", { className: "lt-lb" }, "Join a session"),
-                e("input", {
-                    className: "lt-ci",
-                    placeholder: "Enter code",
-                    value: paste,
-                    maxLength: 6,
-                    onChange: ev => { setPaste(ev.target.value.toUpperCase()); setError(""); }
-                }),
+                e("div", { className: "lt-lb" }, "Permanent room"),
+                e("div", { className: "lt-cb" },
+                    e("span", { className: "lt-cv" }, PERMANENT_ROOM_ID),
+                    e("div", { style: { fontSize: 10, color: "#444", marginTop: 2 } }, "Everyone joins the same room")
+                ),
                 error && e("div", { className: "lt-er" }, error),
                 e("button", {
-                    className: `lt-btn lt-gh ${(!paste.trim() || loading) ? "lt-dim" : ""}`,
+                    className: `lt-btn lt-gh ${loading ? "lt-dim" : ""}`,
                     onClick: join
-                }, loading ? e(React.Fragment, null, e("span", { className: "lt-sp" }), "Connecting…") : "Join session"),
+                }, loading ? e(React.Fragment, null, e("span", { className: "lt-sp" }), "Connecting…") : "Join AN26FC"),
                 e("hr", { className: "lt-dv" }),
                 e("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between" } },
                     e("span", { style: { fontSize: 10, color: "#2a2a2a" } }, getServerUrl() ? "✓ Server configured" : "⚠ No server set"),
@@ -1060,8 +1108,15 @@ function main() {
                     e("div", { className: "lt-npt" }, track)
                 ),
                 e("div", { className: "lt-ic" },
-                    e("span", { className: "lt-iv" }, session.code),
-                    e("button", { className: "lt-cp", onClick: () => copy(session.code) }, "Copy")
+                    e("span", { className: "lt-iv" }, PERMANENT_ROOM_ID),
+                    e("button", { className: "lt-cp", onClick: () => copy(PERMANENT_ROOM_ID) }, "Copy")
+                ),
+                e("div", { className: "lt-ht", style: { marginBottom: 10 } },
+                    e("strong", null, "Permanent host: "),
+                    session.hostName || "not announced",
+                    e("span", { style: { marginLeft: 6, color: session.hostConnected ? "#1ed760" : "#e74c3c" } },
+                        session.hostConnected ? "● online" : "● offline"
+                    )
                 ),
                 session.members.length > 0 && e("div", { className: "lt-ml" },
                     session.members.map(m => {
